@@ -1,0 +1,84 @@
+name: pr-claim
+
+# THE CANONICAL pr-claim CALLER, rolled to every non-archived org repo by
+# docs/handoffs/scripts/reroll-pr-claim.sh. Identical bytes in every repo —
+# nothing per-repo to substitute, which is what makes the roll safe to re-run.
+#
+# WHAT IT CHECKS. That this PR names an issue which is OPEN and still carries a
+# claim — via `Closes #N`, or `Claim-issue: owner/repo#N` on its own line for
+# work that runs under a claim without closing it. `.github-private`#723.
+#
+# WHY EVERY REPO NEEDS THIS FILE BEFORE THE RULESET REQUIRES THE CHECK.
+# A required status check with no workflow producing it never reports. It sits
+# pending forever and every PR in that repo becomes unmergeable. So the order is
+# not a preference:
+#
+#   1. roll this caller to every repo   (this lane)
+#   2. THEN add `pr-claim / pr-claim` to the org ruleset
+#
+# Reversing it bricks the org. Measured on 2026-08-29: `site`#260 opened and
+# merged at 03:09→03:17 with 19 checks and no `pr-claim` among them, and `site`
+# carries no caller — so the check cannot currently be required there.
+#
+# THE PERMISSIONS ARE GRANTED HERE, NOT IN THE REUSABLE. A `workflow_call`
+# callee can only ever NARROW what the caller hands it. A caller that omits
+# `issues: read` leaves the check unable to read a private issue — which it
+# reports as `unreadable` and counts as NOT claimed, the fail-closed direction,
+# but a false red rather than a true one.
+#
+# WHY THE PIN IS bc4cb7d. That is `.github`#299, the newest commit to touch
+# `_pr-claim.yml`: it fails a PR whose BODY says keep an issue open and whose
+# COMMIT says close it. That check exists because #296 carried
+# `Claim-issue: …#295` and `Closes #295` at once, went green, and closed the
+# issue on squash anyway -- which made the follow-up PR naming it unmergeable
+# (`.github-private`#780, #781). A squash merge honours the commit message, so
+# nothing before bc4cb7d can catch it.
+#
+# It supersedes 8a56f22 (#283, which named which state each candidate issue is
+# in). That pin was carried here while 37 of 43 deployed callers had already
+# moved PAST it -- Dependabot bumps each repo's pin independently -- so the
+# template was rolling a door older than most of the fleet was running, and
+# `.github`'s own caller was among the six still on it (#322).
+#
+# The roll script refuses any template not pinned here, so this constant and
+# its GUARD must move together or the roll hard-fails. That is the guard
+# working, not an obstacle to route around.
+#
+# IT DOES NOT AUTHENTICATE THE CLAIMANT. A green `pr-claim` means "an open,
+# claimed issue was named", and no more — an author can name any claimed issue,
+# including someone else's. Closing that needs an authenticated guest identity
+# (`.github-private`#530), not more workflow plumbing. Do not cite this check as
+# authorization.
+
+on:
+  # `edited` is load-bearing, not tidiness (.github#319). The default type set
+  # for `pull_request` is opened/synchronize/reopened, so editing a PR BODY does
+  # not re-trigger this check — and the dependency-intake shape
+  # (bounded-systems/infra#560) works by writing a `Claim-issue:` trailer into
+  # the body of a PR that named no issue. Without this, that trailer lands and
+  # nothing re-evaluates it: 43 injected trailers meant 43 checks re-run by hand
+  # (.github#317), through a credential a workflow does not have — `rerun-failed-jobs`
+  # answers 403 on GITHUB_TOKEN (#309). So this cannot be scripted around; the
+  # trigger is the fix.
+  #
+  # Still `pull_request`, never `pull_request_target`, and still no checkout: the
+  # PR's code is never fetched or executed, and a fork PR still gets a read-only
+  # token. `edited` also fires on title and base-branch edits; the check is
+  # fail-closed on all of them, so more triggers can only mean more refusals,
+  # never fewer.
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-claim:
+    # Reading a PR and an issue. The reusable can only narrow what it is handed,
+    # so the grant is made here — see the note above on what omitting it costs.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    # SHA-pinned, per org policy — never a branch.
+    uses: bounded-systems/.github/.github/workflows/_pr-claim.yml@bc4cb7dada47cc59eed416372a4851201bd6f503
