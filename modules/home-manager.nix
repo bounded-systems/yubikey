@@ -28,6 +28,140 @@
 
 let
   cfg = config.programs.yubikey;
+
+  # Read-only sanity check. Never invokes -t ed25519-sk, never touches the
+  # authenticator — it only resolves PATH, so it is safe to run unattended
+  # and as often as wanted. Deliberately separate from the disposable probe
+  # below, which does touch hardware and is not something to run casually.
+  preflight = pkgs.writeShellApplication {
+    name = "yubikey-preflight";
+    text = ''
+      resolved="$(command -v ssh-keygen || true)"
+      if [ -z "$resolved" ]; then
+        echo "FAIL: no ssh-keygen on PATH" >&2
+        exit 1
+      fi
+      case "$resolved" in
+        /usr/bin/*)
+          echo "FAIL: ssh-keygen resolves to $resolved — nix-provided openssh (${cfg.ssh.package}) is not ahead of /usr/bin on PATH" >&2
+          exit 1
+          ;;
+        *)
+          echo "OK: ssh-keygen resolves to $resolved"
+          ;;
+      esac
+
+      if ! command -v ykman >/dev/null 2>&1; then
+        echo "FAIL: ykman not on PATH (programs.yubikey.enable should provide it)" >&2
+        exit 1
+      fi
+      echo "OK: ykman on PATH at $(command -v ykman)"
+
+      if ykman info >/dev/null 2>&1; then
+        echo "--- ykman info (device present) ---"
+        ykman info
+        echo "Firmware must be >= 5.7 for ed25519-sk resident keys; check the line above."
+      else
+        echo "NOTE: no YubiKey detected (ykman info failed) — insert one to check firmware."
+      fi
+    '';
+  };
+
+  # The scoped, disposable liveness probe. Runs ssh-keygen against a
+  # throwaway path in a fresh temp directory with a hard timeout, and treats
+  # anything past "you may need to touch" as success — it does not wait for
+  # an actual touch, does not accept a PIN, and always tears itself down
+  # (temp dir + child process) via its own trap, so it never depends on
+  # being killed from outside. NOT run automatically; invoke by hand.
+  probe = pkgs.writeShellApplication {
+    name = "yubikey-probe";
+    text = ''
+      resolved="$(command -v ssh-keygen)"
+      case "$resolved" in
+        /usr/bin/*)
+          echo "FAIL: ssh-keygen resolves to $resolved, not a nix-provided build" >&2
+          exit 1
+          ;;
+      esac
+
+      tmpdir="$(mktemp -d)"
+      trap 'kill "$kgpid" 2>/dev/null || true; rm -rf "$tmpdir"' EXIT
+
+      out="$tmpdir/out"
+      "$resolved" -t ed25519-sk -f "$tmpdir/probe" -N "" -C yubikey-probe-disposable \
+        >"$out" 2>&1 &
+      kgpid=$!
+
+      # Poll for the touch line instead of a fixed sleep, bounded at 10s.
+      status="timeout"
+      for _ in $(seq 1 20); do
+        if grep -q "touch your authenticator" "$out" 2>/dev/null; then
+          status="touch-prompt"
+          break
+        fi
+        if ! kill -0 "$kgpid" 2>/dev/null; then
+          status="exited"
+          break
+        fi
+        sleep 0.5
+      done
+
+      cat "$out"
+      case "$status" in
+        touch-prompt)
+          echo "PASS: reached the touch prompt via $resolved"
+          exit 0
+          ;;
+        exited)
+          echo "FAIL: ssh-keygen exited before prompting for touch — see output above" >&2
+          exit 1
+          ;;
+        timeout)
+          echo "FAIL: no touch prompt within 10s — see output above" >&2
+          exit 1
+          ;;
+      esac
+    '';
+  };
+
+  # Append one line to allowed_signers if it is not already present, rather
+  # than overwrite the file — this module deliberately never generates
+  # allowed_signers wholesale (see signing.allowedSignersFile above).
+  allowedSigners = pkgs.writeShellApplication {
+    name = "yubikey-allowed-signers";
+    text = ''
+      if [ "$#" -lt 2 ]; then
+        echo "usage: yubikey-allowed-signers <email> <path-to-pubkey> [comment]" >&2
+        exit 1
+      fi
+      email="$1"
+      pubkey_path="$2"
+      comment="''${3:-}"
+
+      if [ ! -f "$pubkey_path" ]; then
+        echo "FAIL: $pubkey_path does not exist" >&2
+        exit 1
+      fi
+
+      keytype_and_key="$(cut -d' ' -f1,2 "$pubkey_path")"
+      line="$email $keytype_and_key"
+      if [ -n "$comment" ]; then
+        line="$line  # $comment"
+      fi
+
+      target="${cfg.signing.allowedSignersFile}"
+      mkdir -p "$(dirname "$target")"
+      touch "$target"
+
+      if grep -qF "$email $keytype_and_key" "$target"; then
+        echo "OK: already present in $target"
+        exit 0
+      fi
+
+      echo "$line" >> "$target"
+      echo "OK: appended to $target"
+    '';
+  };
 in
 {
   options.programs.yubikey = {
@@ -60,6 +194,24 @@ in
           The hardware-backed key. `_sk` suffix is load-bearing: it is what
           distinguishes a FIDO2-resident key from a software key sitting in
           the same directory, at a glance and in a backup.
+        '';
+      };
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.openssh;
+        defaultText = lib.literalExpression "pkgs.openssh";
+        description = ''
+          The `ssh-keygen`/`ssh` build put on PATH ahead of `/usr/bin`.
+
+          Verified live on phobos (2026-09-15): `pkgs.openssh` is built with
+          `--with-security-key-builtin=yes`, so `ssh-keygen -t ed25519-sk`
+          reaches "You may need to touch your authenticator" against a real
+          device with no `SSH_SK_PROVIDER` set — the FIDO2 middleware is
+          compiled in, not an external provider library. Home-manager's
+          `home.packages` already lands ahead of `/usr/bin` in PATH, so no
+          separate PATH surgery is needed here — declaring the package is
+          the whole fix.
         '';
       };
     };
@@ -105,6 +257,7 @@ in
     { home.packages = [ cfg.package ]; }
 
     (lib.mkIf cfg.ssh.enable {
+      home.packages = [ cfg.ssh.package preflight probe ];
       programs.ssh.enable = lib.mkDefault true;
       # mkDefault throughout: a consuming config that already has opinions
       # about ssh should win without having to disable this half.
@@ -115,6 +268,7 @@ in
     })
 
     (lib.mkIf cfg.signing.enable {
+      home.packages = [ allowedSigners ];
       programs.git.extraConfig = {
         gpg.format = lib.mkDefault "ssh";
         gpg.ssh.allowedSignersFile = lib.mkDefault cfg.signing.allowedSignersFile;
