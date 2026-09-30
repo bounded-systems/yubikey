@@ -269,7 +269,9 @@ in
 
     (lib.mkIf cfg.signing.enable {
       home.packages = [ allowedSigners ];
-      programs.git.extraConfig = {
+      # `settings`, not the old `extraConfig`: home-manager renamed it, and the
+      # alias prints a trace warning on every evaluation.
+      programs.git.settings = {
         gpg.format = lib.mkDefault "ssh";
         gpg.ssh.allowedSignersFile = lib.mkDefault cfg.signing.allowedSignersFile;
         user.signingKey = lib.mkDefault "${cfg.ssh.identityFile}.pub";
